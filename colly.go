@@ -8,17 +8,27 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/gocolly/colly/debug"
+
+	"google.golang.org/appengine"
+	"google.golang.org/appengine/urlfetch"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/kennygrant/sanitize"
 	"github.com/temoto/robotstxt"
 )
 
@@ -52,12 +62,15 @@ type Collector struct {
 	// the target host's robots.txt file.  See http://www.robotstxt.org/ for more
 	// information.
 	IgnoreRobotsTxt   bool
+	debugger          debug.Debugger
 	visitedURLs       []string
 	robotsMap         map[string]*robotstxt.RobotsData
-	htmlCallbacks     map[string]HTMLCallback
+	htmlCallbacks     []*htmlCallbackContainer
 	requestCallbacks  []RequestCallback
 	responseCallbacks []ResponseCallback
 	errorCallbacks    []ErrorCallback
+	requestCount      int32
+	responseCount     int32
 	backend           *httpBackend
 	wg                *sync.WaitGroup
 	lock              *sync.RWMutex
@@ -72,7 +85,9 @@ type Request struct {
 	// Ctx is a context between a Request and a Response
 	Ctx *Context
 	// Depth is the number of the parents of this request
-	Depth     int
+	Depth int
+	// Unique identifier of the request
+	Id        int32
 	collector *Collector
 }
 
@@ -107,7 +122,7 @@ type HTMLElement struct {
 
 // Context provides a tiny layer for passing data between callbacks
 type Context struct {
-	contextMap map[string]string
+	contextMap map[string]interface{}
 	lock       *sync.RWMutex
 }
 
@@ -123,6 +138,11 @@ type HTMLCallback func(*HTMLElement)
 // ErrorCallback is a type alias for OnError callback functions
 type ErrorCallback func(*Response, error)
 
+type htmlCallbackContainer struct {
+	Selector string
+	Function HTMLCallback
+}
+
 // NewCollector creates a new Collector instance with default configuration
 func NewCollector() *Collector {
 	c := &Collector{}
@@ -133,7 +153,7 @@ func NewCollector() *Collector {
 // NewContext initializes a new Context instance
 func NewContext() *Context {
 	return &Context{
-		contextMap: make(map[string]string),
+		contextMap: make(map[string]interface{}),
 		lock:       &sync.RWMutex{},
 	}
 }
@@ -141,10 +161,10 @@ func NewContext() *Context {
 // Init initializes the Collector's private variables and sets default
 // configuration for the Collector
 func (c *Collector) Init() {
-	c.UserAgent = "colly - https://github.com/asciimoo/colly"
+	c.UserAgent = "colly - https://github.com/gocolly/colly"
 	c.MaxDepth = 0
 	c.visitedURLs = make([]string, 0, 8)
-	c.htmlCallbacks = make(map[string]HTMLCallback, 0)
+	c.htmlCallbacks = make([]*htmlCallbackContainer, 0, 8)
 	c.requestCallbacks = make([]RequestCallback, 0, 8)
 	c.responseCallbacks = make([]ResponseCallback, 0, 8)
 	c.errorCallbacks = make([]ErrorCallback, 0, 8)
@@ -156,6 +176,20 @@ func (c *Collector) Init() {
 	c.lock = &sync.RWMutex{}
 	c.robotsMap = make(map[string]*robotstxt.RobotsData, 0)
 	c.IgnoreRobotsTxt = true
+}
+
+// Appengine will replace the Collector's backend http.Client
+// With an Http.Client that is provided by appengine/urlfetch
+// This function should be used when the scraper is initiated
+// by a http.Request to Google App Engine
+func (c *Collector) Appengine(req *http.Request) {
+	ctx := appengine.NewContext(req)
+	client := urlfetch.Client(ctx)
+	client.Jar = c.backend.Client.Jar
+	client.CheckRedirect = c.backend.Client.CheckRedirect
+	client.Timeout = c.backend.Client.Timeout
+
+	c.backend.Client = client
 }
 
 // Visit starts Collector's collecting job by creating a
@@ -187,10 +221,30 @@ func (c *Collector) PostMultipart(URL string, requestData map[string][]byte) err
 	return c.scrape(URL, "POST", 1, createMultipartReader(boundary, requestData), nil, hdr)
 }
 
+// Request starts a collector job by creating a custom HTTP request
+// where method, context, headers and request data can be specified.
+// Set requestData, ctx, hdr parameters to nil if you don't want to use them.
+// Valid methods:
+//   - "GET"
+//   - "POST"
+//   - "PUT"
+//   - "DELETE"
+//   - "PATCH"
+//   - "OPTIONS"
+func (c *Collector) Request(method, URL string, requestData io.Reader, ctx *Context, hdr http.Header) error {
+	return c.scrape(URL, method, 1, requestData, ctx, hdr)
+}
+
+// SetDebugger attaches a debugger to the collector
+func (c *Collector) SetDebugger(d debug.Debugger) {
+	d.Init()
+	c.debugger = d
+}
+
 func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header) error {
 	c.wg.Add(1)
 	defer c.wg.Done()
-	if err := c.requestCheck(u, depth); err != nil {
+	if err := c.requestCheck(u, method, depth); err != nil {
 		return err
 	}
 	parsedURL, err := url.Parse(u)
@@ -229,6 +283,7 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 		Ctx:       ctx,
 		Depth:     depth,
 		collector: c,
+		Id:        atomic.AddInt32(&c.requestCount, 1),
 	}
 
 	c.handleOnRequest(request)
@@ -240,18 +295,19 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	if err := c.handleOnError(response, err, request, ctx); err != nil {
 		return err
 	}
+	atomic.AddInt32(&c.responseCount, 1)
 	response.Ctx = ctx
 	response.Request = request
 	response.fixCharset()
 
 	c.handleOnResponse(response)
 
-	c.handleOnHTML(request, response)
+	c.handleOnHTML(response)
 
 	return nil
 }
 
-func (c *Collector) requestCheck(u string, depth int) error {
+func (c *Collector) requestCheck(u, method string, depth int) error {
 	if u == "" {
 		return errors.New("Missing URL")
 	}
@@ -270,7 +326,7 @@ func (c *Collector) requestCheck(u string, depth int) error {
 			return errors.New("No URLFilters match")
 		}
 	}
-	if !c.AllowURLRevisit {
+	if !c.AllowURLRevisit && method == "GET" {
 		for _, u2 := range c.visitedURLs {
 			if u2 == u {
 				return errors.New("URL already visited")
@@ -332,6 +388,20 @@ func (c *Collector) checkRobots(u *url.URL) error {
 	return nil
 }
 
+// String is the text representation of the collector.
+// It contains useful debug information about the collector's internals
+func (c *Collector) String() string {
+	return fmt.Sprintf(
+		"Requests made: %d (%d responses) | Callbacks: OnRequest: %d, OnHTML: %d, OnResponse: %d, OnError: %d",
+		c.requestCount,
+		c.responseCount,
+		len(c.requestCallbacks),
+		len(c.htmlCallbacks),
+		len(c.responseCallbacks),
+		len(c.errorCallbacks),
+	)
+}
+
 // Wait returns when the collector jobs are finished
 func (c *Collector) Wait() {
 	c.wg.Wait()
@@ -357,14 +427,26 @@ func (c *Collector) OnResponse(f ResponseCallback) {
 // GoQuery Selector is a selector used by https://github.com/PuerkitoBio/goquery
 func (c *Collector) OnHTML(goquerySelector string, f HTMLCallback) {
 	c.lock.Lock()
-	c.htmlCallbacks[goquerySelector] = f
+	c.htmlCallbacks = append(c.htmlCallbacks, &htmlCallbackContainer{
+		Selector: goquerySelector,
+		Function: f,
+	})
 	c.lock.Unlock()
 }
 
 // OnHTMLDetach deregister a function. Function will not be execute after detached
 func (c *Collector) OnHTMLDetach(goquerySelector string) {
 	c.lock.Lock()
-	delete(c.htmlCallbacks, goquerySelector)
+	deleteIdx := -1
+	for i, cc := range c.htmlCallbacks {
+		if cc.Selector == goquerySelector {
+			deleteIdx = i
+			break
+		}
+	}
+	if deleteIdx != -1 {
+		c.htmlCallbacks = append(c.htmlCallbacks[:deleteIdx], c.htmlCallbacks[deleteIdx+1:]...)
+	}
 	c.lock.Unlock()
 }
 
@@ -376,14 +458,19 @@ func (c *Collector) OnError(f ErrorCallback) {
 	c.lock.Unlock()
 }
 
-// WithTransport allows you to set a custom http.RoundTripper (transport) for this collector.
+// WithTransport allows you to set a custom http.RoundTripper (transport)
 func (c *Collector) WithTransport(transport http.RoundTripper) {
 	c.backend.Client.Transport = transport
 }
 
-// DisableCookies turns off cookie handling for this collector
+// DisableCookies turns off cookie handling
 func (c *Collector) DisableCookies() {
 	c.backend.Client.Jar = nil
+}
+
+// SetCookieJar overrides the previously set cookie jar
+func (c *Collector) SetCookieJar(j *cookiejar.Jar) {
+	c.backend.Client.Jar = j
 }
 
 // SetRequestTimeout overrides the default timeout (10 seconds) for this collector
@@ -412,18 +499,37 @@ func (c *Collector) SetProxy(proxyURL string) error {
 }
 
 func (c *Collector) handleOnRequest(r *Request) {
+	if c.debugger != nil {
+		c.debugger.Event(&debug.Event{
+			Type:      "request",
+			RequestId: r.Id,
+			Values: map[string]string{
+				"url": r.URL.String(),
+			},
+		})
+	}
 	for _, f := range c.requestCallbacks {
 		f(r)
 	}
 }
 
 func (c *Collector) handleOnResponse(r *Response) {
+	if c.debugger != nil {
+		c.debugger.Event(&debug.Event{
+			Type:      "response",
+			RequestId: r.Request.Id,
+			Values: map[string]string{
+				"url":    r.Request.URL.String(),
+				"status": http.StatusText(r.StatusCode),
+			},
+		})
+	}
 	for _, f := range c.responseCallbacks {
 		f(r)
 	}
 }
 
-func (c *Collector) handleOnHTML(req *Request, resp *Response) {
+func (c *Collector) handleOnHTML(resp *Response) {
 	if strings.Index(strings.ToLower(resp.Headers.Get("Content-Type")), "html") == -1 {
 		return
 	}
@@ -431,18 +537,28 @@ func (c *Collector) handleOnHTML(req *Request, resp *Response) {
 	if err != nil {
 		return
 	}
-	for expr, f := range c.htmlCallbacks {
-		doc.Find(expr).Each(func(i int, s *goquery.Selection) {
+	for _, cc := range c.htmlCallbacks {
+		doc.Find(cc.Selector).Each(func(i int, s *goquery.Selection) {
 			for _, n := range s.Nodes {
 				e := &HTMLElement{
 					Name:       n.Data,
-					Request:    req,
+					Request:    resp.Request,
 					Response:   resp,
 					Text:       goquery.NewDocumentFromNode(n).Text(),
 					DOM:        s,
 					attributes: n.Attr,
 				}
-				f(e)
+				if c.debugger != nil {
+					c.debugger.Event(&debug.Event{
+						Type:      "html",
+						RequestId: resp.Request.Id,
+						Values: map[string]string{
+							"selector": cc.Selector,
+							"url":      resp.Request.URL.String(),
+						},
+					})
+				}
+				cc.Function(e)
 			}
 		})
 	}
@@ -460,6 +576,16 @@ func (c *Collector) handleOnError(response *Response, err error, request *Reques
 			Request: request,
 			Ctx:     ctx,
 		}
+	}
+	if c.debugger != nil {
+		c.debugger.Event(&debug.Event{
+			Type:      "error",
+			RequestId: request.Id,
+			Values: map[string]string{
+				"url":    request.URL.String(),
+				"status": http.StatusText(response.StatusCode),
+			},
+		})
 	}
 	if response.Request == nil {
 		response.Request = request
@@ -503,6 +629,29 @@ func (c *Collector) Cookies(URL string) []*http.Cookie {
 		return nil
 	}
 	return c.backend.Client.Jar.Cookies(u)
+}
+
+// Clone creates an exact copy of a Collector without callbacks.
+// HTTP backend, robots.txt cache and cookie jar are shared
+// between collectors.
+func (c *Collector) Clone() *Collector {
+	return &Collector{
+		UserAgent:         c.UserAgent,
+		MaxDepth:          c.MaxDepth,
+		visitedURLs:       make([]string, 0, 8),
+		htmlCallbacks:     make([]*htmlCallbackContainer, 0, 8),
+		requestCallbacks:  make([]RequestCallback, 0, 8),
+		responseCallbacks: make([]ResponseCallback, 0, 8),
+		errorCallbacks:    make([]ErrorCallback, 0, 8),
+		CacheDir:          c.CacheDir,
+		MaxBodySize:       c.MaxBodySize,
+		backend:           c.backend,
+		wg:                c.wg,
+		lock:              c.lock,
+		robotsMap:         c.robotsMap,
+		IgnoreRobotsTxt:   c.IgnoreRobotsTxt,
+		debugger:          c.debugger,
+	}
 }
 
 func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Request) error {
@@ -549,6 +698,27 @@ func (h *HTMLElement) Attr(k string) string {
 // elements.
 func (h *HTMLElement) ChildText(goquerySelector string) string {
 	return strings.TrimSpace(h.DOM.Find(goquerySelector).Text())
+}
+
+// ChildAttr returns the stripped text content of the first matching
+// element's attribute.
+func (h *HTMLElement) ChildAttr(goquerySelector, attrName string) string {
+	if attr, ok := h.DOM.Find(goquerySelector).Attr(attrName); ok {
+		return strings.TrimSpace(attr)
+	}
+	return ""
+}
+
+// ChildAttrs returns the stripped text content of all the matching
+// element's attributes.
+func (h *HTMLElement) ChildAttrs(goquerySelector, attrName string) []string {
+	res := make([]string, 0)
+	h.DOM.Find(goquerySelector).Each(func(_ int, s *goquery.Selection) {
+		if attr, ok := s.Attr(attrName); ok {
+			res = append(res, strings.TrimSpace(attr))
+		}
+	})
+	return res
 }
 
 // AbsoluteURL returns with the resolved absolute URL of an URL chunk.
@@ -613,23 +783,66 @@ func (c *Context) MarshalBinary() (_ []byte, _ error) {
 	return nil, nil
 }
 
-// Put stores a value in Context
-func (c *Context) Put(key, value string) {
+// Put stores a value of any type in Context
+func (c *Context) Put(key string, value interface{}) {
 	c.lock.Lock()
 	c.contextMap[key] = value
 	c.lock.Unlock()
 }
 
-// Get retrieves a value from Context.
+// Get retrieves a string value from Context.
 // Get returns an empty string if key not found
 func (c *Context) Get(key string) string {
 	c.lock.RLock()
+	defer c.lock.RUnlock()
 	if v, ok := c.contextMap[key]; ok {
-		c.lock.RUnlock()
+		return v.(string)
+	}
+	return ""
+}
+
+// GetAny retrieves a value from Context.
+// GetAny returns nil if key not found
+func (c *Context) GetAny(key string) interface{} {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	if v, ok := c.contextMap[key]; ok {
 		return v
 	}
-	c.lock.RUnlock()
-	return ""
+	return nil
+}
+
+// Save writes response body to disk
+func (r *Response) Save(fileName string) error {
+	return ioutil.WriteFile(fileName, r.Body, 0644)
+}
+
+// FileName returns the sanitized file name parsed from "Content-Disposition"
+// header or from URL
+func (r *Response) FileName() string {
+	_, params, err := mime.ParseMediaType(r.Headers.Get("Content-Disposition"))
+	if fName, ok := params["filename"]; ok && err == nil {
+		return SanitizeFileName(fName)
+	}
+	if r.Request.URL.RawQuery != "" {
+		return SanitizeFileName(fmt.Sprintf("%s_%s", r.Request.URL.Path, r.Request.URL.RawQuery))
+	}
+	return SanitizeFileName(r.Request.URL.Path[1:])
+}
+
+// SanitizeFileName replaces dangerous characters in a string
+// so the return value can be used as a safe file name.
+func SanitizeFileName(fileName string) string {
+	ext := filepath.Ext(fileName)
+	cleanExt := sanitize.BaseName(ext)
+	if cleanExt == "" {
+		cleanExt = ".unknown"
+	}
+	return strings.Replace(fmt.Sprintf(
+		"%s.%s",
+		sanitize.BaseName(fileName[:len(fileName)-len(ext)]),
+		cleanExt[1:],
+	), "-", "_", -1)
 }
 
 func createFormReader(data map[string]string) io.Reader {

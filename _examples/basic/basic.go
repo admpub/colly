@@ -2,20 +2,16 @@ package main
 
 import (
 	"fmt"
-	"regexp"
 
-	"github.com/asciimoo/colly"
+	"github.com/gocolly/colly"
 )
 
 func main() {
 	// Instantiate default collector
 	c := colly.NewCollector()
 
-	// Visit only root url and urls which start with "e" or "h" on httpbin.org
-	c.URLFilters = []*regexp.Regexp{
-		regexp.MustCompile("http://httpbin\\.org/(|e.+)$"),
-		regexp.MustCompile("http://httpbin\\.org/h.+"),
-	}
+	// Visit only domains: hackerspaces.org, wiki.hackerspaces.org
+	c.AllowedDomains = []string{"hackerspaces.org", "wiki.hackerspaces.org"}
 
 	// On every a element which has href attribute call callback
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
@@ -23,7 +19,7 @@ func main() {
 		// Print link
 		fmt.Printf("Link found: %q -> %s\n", e.Text, link)
 		// Visit link found on page
-		// Only those links are visited which are matched by  any of the URLFilter regexps
+		// Only those links are visited which are in AllowedDomains
 		c.Visit(e.Request.AbsoluteURL(link))
 	})
 
@@ -33,5 +29,5 @@ func main() {
 	})
 
 	// Start scraping on https://hackerspaces.org
-	c.Visit("http://httpbin.org/")
+	c.Visit("https://hackerspaces.org/")
 }

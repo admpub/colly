@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/asciimoo/colly"
+	"github.com/gocolly/colly"
 )
 
 // Course stores information about a coursera course
@@ -27,17 +27,15 @@ func main() {
 	// Instantiate default collector
 	c := colly.NewCollector()
 
-	// Create another collector to scrape course details
-	detailCollector := colly.NewCollector()
-
 	// Visit only domains: coursera.org, www.coursera.org
 	c.AllowedDomains = []string{"coursera.org", "www.coursera.org"}
-	detailCollector.AllowedDomains = c.AllowedDomains
 
 	// Cache responses to prevent multiple download of pages
 	// even if the collector is restarted
 	c.CacheDir = "./coursera_cache"
-	detailCollector.CacheDir = c.CacheDir
+
+	// Create another collector to scrape course details
+	detailCollector := c.Clone()
 
 	courses := make([]Course, 0, 200)
 
@@ -66,10 +64,9 @@ func main() {
 	c.OnHTML(`a[name]`, func(e *colly.HTMLElement) {
 		// Activate detailCollector if the link contains "coursera.org/learn"
 		courseURL := e.Request.AbsoluteURL(e.Attr("href"))
-		if strings.Index(courseURL, "coursera.org/learn") == -1 {
-			return
+		if strings.Index(courseURL, "coursera.org/learn") != -1 {
+			detailCollector.Visit(courseURL)
 		}
-		detailCollector.Visit(courseURL)
 	})
 
 	// Extract details of the course

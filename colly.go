@@ -61,7 +61,9 @@ type Collector struct {
 	// IgnoreRobotsTxt allows the Collector to ignore any restrictions set by
 	// the target host's robots.txt file.  See http://www.robotstxt.org/ for more
 	// information.
-	IgnoreRobotsTxt   bool
+	IgnoreRobotsTxt bool
+	// Id is the unique identifier of a collector
+	Id                int32
 	debugger          debug.Debugger
 	visitedURLs       []string
 	robotsMap         map[string]*robotstxt.RobotsData
@@ -143,6 +145,8 @@ type htmlCallbackContainer struct {
 	Function HTMLCallback
 }
 
+var collectorCounter int32 = 0
+
 // NewCollector creates a new Collector instance with default configuration
 func NewCollector() *Collector {
 	c := &Collector{}
@@ -176,6 +180,7 @@ func (c *Collector) Init() {
 	c.lock = &sync.RWMutex{}
 	c.robotsMap = make(map[string]*robotstxt.RobotsData, 0)
 	c.IgnoreRobotsTxt = true
+	c.Id = atomic.AddInt32(&collectorCounter, 1)
 }
 
 // Appengine will replace the Collector's backend http.Client
@@ -498,15 +503,20 @@ func (c *Collector) SetProxy(proxyURL string) error {
 	return nil
 }
 
+func createEvent(eventType string, requestId, collectorId int32, kvargs map[string]string) *debug.Event {
+	return &debug.Event{
+		CollectorId: collectorId,
+		RequestId:   requestId,
+		Type:        eventType,
+		Values:      kvargs,
+	}
+}
+
 func (c *Collector) handleOnRequest(r *Request) {
 	if c.debugger != nil {
-		c.debugger.Event(&debug.Event{
-			Type:      "request",
-			RequestId: r.Id,
-			Values: map[string]string{
-				"url": r.URL.String(),
-			},
-		})
+		c.debugger.Event(createEvent("request", r.Id, c.Id, map[string]string{
+			"url": r.URL.String(),
+		}))
 	}
 	for _, f := range c.requestCallbacks {
 		f(r)
@@ -515,14 +525,10 @@ func (c *Collector) handleOnRequest(r *Request) {
 
 func (c *Collector) handleOnResponse(r *Response) {
 	if c.debugger != nil {
-		c.debugger.Event(&debug.Event{
-			Type:      "response",
-			RequestId: r.Request.Id,
-			Values: map[string]string{
-				"url":    r.Request.URL.String(),
-				"status": http.StatusText(r.StatusCode),
-			},
-		})
+		c.debugger.Event(createEvent("response", r.Request.Id, c.Id, map[string]string{
+			"url":    r.Request.URL.String(),
+			"status": http.StatusText(r.StatusCode),
+		}))
 	}
 	for _, f := range c.responseCallbacks {
 		f(r)
@@ -549,14 +555,10 @@ func (c *Collector) handleOnHTML(resp *Response) {
 					attributes: n.Attr,
 				}
 				if c.debugger != nil {
-					c.debugger.Event(&debug.Event{
-						Type:      "html",
-						RequestId: resp.Request.Id,
-						Values: map[string]string{
-							"selector": cc.Selector,
-							"url":      resp.Request.URL.String(),
-						},
-					})
+					c.debugger.Event(createEvent("html", resp.Request.Id, c.Id, map[string]string{
+						"selector": cc.Selector,
+						"url":      resp.Request.URL.String(),
+					}))
 				}
 				cc.Function(e)
 			}
@@ -578,14 +580,10 @@ func (c *Collector) handleOnError(response *Response, err error, request *Reques
 		}
 	}
 	if c.debugger != nil {
-		c.debugger.Event(&debug.Event{
-			Type:      "error",
-			RequestId: request.Id,
-			Values: map[string]string{
-				"url":    request.URL.String(),
-				"status": http.StatusText(response.StatusCode),
-			},
-		})
+		c.debugger.Event(createEvent("error", request.Id, c.Id, map[string]string{
+			"url":    request.URL.String(),
+			"status": http.StatusText(response.StatusCode),
+		}))
 	}
 	if response.Request == nil {
 		response.Request = request
@@ -650,6 +648,7 @@ func (c *Collector) Clone() *Collector {
 		lock:              c.lock,
 		robotsMap:         c.robotsMap,
 		IgnoreRobotsTxt:   c.IgnoreRobotsTxt,
+		Id:                atomic.AddInt32(&collectorCounter, 1),
 		debugger:          c.debugger,
 	}
 }

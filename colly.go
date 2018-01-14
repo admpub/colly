@@ -6,9 +6,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
-	"io/ioutil"
-	"mime"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -23,9 +22,6 @@ import (
 
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/urlfetch"
-
-	"golang.org/x/net/html"
-	"golang.org/x/net/html/charset"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/kennygrant/sanitize"
@@ -62,70 +58,24 @@ type Collector struct {
 	// the target host's robots.txt file.  See http://www.robotstxt.org/ for more
 	// information.
 	IgnoreRobotsTxt bool
-	// Id is the unique identifier of a collector
-	Id                int32
+	// ID is the unique identifier of a collector
+	ID uint32
+	// DetectCharset can enable character encoding detection for non-utf8 response bodies
+	// without explicit charset declaration. This feature uses https://github.com/saintfish/chardet
+	DetectCharset     bool
 	debugger          debug.Debugger
-	visitedURLs       []string
+	visitedURLs       map[uint64]bool
 	robotsMap         map[string]*robotstxt.RobotsData
 	htmlCallbacks     []*htmlCallbackContainer
 	requestCallbacks  []RequestCallback
 	responseCallbacks []ResponseCallback
 	errorCallbacks    []ErrorCallback
-	requestCount      int32
-	responseCount     int32
+	scrapedCallbacks  []ScrapedCallback
+	requestCount      uint32
+	responseCount     uint32
 	backend           *httpBackend
 	wg                *sync.WaitGroup
 	lock              *sync.RWMutex
-}
-
-// Request is the representation of a HTTP request made by a Collector
-type Request struct {
-	// URL is the parsed URL of the HTTP request
-	URL *url.URL
-	// Headers contains the Request's HTTP headers
-	Headers *http.Header
-	// Ctx is a context between a Request and a Response
-	Ctx *Context
-	// Depth is the number of the parents of this request
-	Depth int
-	// Unique identifier of the request
-	Id        int32
-	collector *Collector
-}
-
-// Response is the representation of a HTTP response made by a Collector
-type Response struct {
-	// StatusCode is the status code of the Response
-	StatusCode int
-	// Body is the content of the Response
-	Body []byte
-	// Ctx is a context between a Request and a Response
-	Ctx *Context
-	// Request is the Request object of the response
-	Request *Request
-	// Headers contains the Response's HTTP headers
-	Headers *http.Header
-}
-
-// HTMLElement is the representation of a HTML tag.
-type HTMLElement struct {
-	// Name is the name of the tag
-	Name       string
-	Text       string
-	attributes []html.Attribute
-	// Request is the request object of the element's HTML document
-	Request *Request
-	// Response is the Response object of the element's HTML document
-	Response *Response
-	// DOM is the goquery parsed DOM object of the page. DOM is relative
-	// to the current HTMLElement
-	DOM *goquery.Selection
-}
-
-// Context provides a tiny layer for passing data between callbacks
-type Context struct {
-	contextMap map[string]interface{}
-	lock       *sync.RWMutex
 }
 
 // RequestCallback is a type alias for OnRequest callback functions
@@ -140,25 +90,137 @@ type HTMLCallback func(*HTMLElement)
 // ErrorCallback is a type alias for OnError callback functions
 type ErrorCallback func(*Response, error)
 
+// ScrapedCallback is a type alias for OnScraped callback functions
+type ScrapedCallback func(*Response)
+
+// ProxyFunc is a type alias for proxy setter functions.
+type ProxyFunc func(*http.Request) (*url.URL, error)
+
 type htmlCallbackContainer struct {
 	Selector string
 	Function HTMLCallback
 }
 
-var collectorCounter int32 = 0
+var collectorCounter uint32
+
+var (
+	// ErrForbiddenDomain is the error thrown if visiting
+	// a domain which is not allowed in AllowedDomains
+	ErrForbiddenDomain = errors.New("Forbidden domain")
+	// ErrMissingURL is the error type for missing URL errors
+	ErrMissingURL = errors.New("Missing URL")
+	// ErrMaxDepth is the error type for exceeding max depth
+	ErrMaxDepth = errors.New("Max depth limit reached")
+	// ErrNoURLFiltersMatch is the error thrown if visiting
+	// a URL which is not allowed by URLFilters
+	ErrNoURLFiltersMatch = errors.New("No URLFilters match")
+	// ErrAlreadyVisited is the error type for already visited URLs
+	ErrAlreadyVisited = errors.New("URL already visited")
+	// ErrRobotsTxtBlocked is the error type for robots.txt errors
+	ErrRobotsTxtBlocked = errors.New("URL blocked by robots.txt")
+	// ErrNoCookieJar is the error type for missing cookie jar
+	ErrNoCookieJar = errors.New("Cookie jar is not available")
+	// ErrNoPattern is the error type for LimitRules without patterns
+	ErrNoPattern = errors.New("No pattern defined in LimitRule")
+)
 
 // NewCollector creates a new Collector instance with default configuration
-func NewCollector() *Collector {
+func NewCollector(options ...func(*Collector)) *Collector {
 	c := &Collector{}
 	c.Init()
+
+	for _, f := range options {
+		f(c)
+	}
+
 	return c
 }
 
-// NewContext initializes a new Context instance
-func NewContext() *Context {
-	return &Context{
-		contextMap: make(map[string]interface{}),
-		lock:       &sync.RWMutex{},
+// UserAgent sets the user agent used by the Collector.
+func UserAgent(ua string) func(*Collector) {
+	return func(c *Collector) {
+		c.UserAgent = ua
+	}
+}
+
+// MaxDepth limits the recursion depth of visited URLs.
+func MaxDepth(depth int) func(*Collector) {
+	return func(c *Collector) {
+		c.MaxDepth = depth
+	}
+}
+
+// AllowedDomains sets the domain whitelist used by the Collector.
+func AllowedDomains(domains ...string) func(*Collector) {
+	return func(c *Collector) {
+		c.AllowedDomains = domains
+	}
+}
+
+// DisallowedDomains sets the domain blacklist used by the Collector.
+func DisallowedDomains(domains ...string) func(*Collector) {
+	return func(c *Collector) {
+		c.DisallowedDomains = domains
+	}
+}
+
+// URLFilters sets the list of regular expressions which restricts
+// visiting URLs. If any of the rules matches to a URL the request won't be stopped.
+func URLFilters(filters ...*regexp.Regexp) func(*Collector) {
+	return func(c *Collector) {
+		c.URLFilters = filters
+	}
+}
+
+// AllowURLRevisit instructs the Collector to allow multiple downloads of the same URL
+func AllowURLRevisit() func(*Collector) {
+	return func(c *Collector) {
+		c.AllowURLRevisit = true
+	}
+}
+
+// MaxBodySize sets the limit of the retrieved response body in bytes.
+func MaxBodySize(sizeInBytes int) func(*Collector) {
+	return func(c *Collector) {
+		c.MaxBodySize = sizeInBytes
+	}
+}
+
+// CacheDir specifies the location where GET requests are cached as files.
+func CacheDir(path string) func(*Collector) {
+	return func(c *Collector) {
+		c.CacheDir = path
+	}
+}
+
+// IgnoreRobotsTxt instructs the Collector to ignore any restrictions
+// set by the target host's robots.txt file.
+func IgnoreRobotsTxt() func(*Collector) {
+	return func(c *Collector) {
+		c.IgnoreRobotsTxt = true
+	}
+}
+
+// ID sets the unique identifier of the Collector.
+func ID(id uint32) func(*Collector) {
+	return func(c *Collector) {
+		c.ID = id
+	}
+}
+
+// DetectCharset enables character encoding detection for non-utf8 response bodies
+// without explicit charset declaration. This feature uses https://github.com/saintfish/chardet
+func DetectCharset() func(*Collector) {
+	return func(c *Collector) {
+		c.DetectCharset = true
+	}
+}
+
+// Debugger sets the debugger used by the Collector.
+func Debugger(d debug.Debugger) func(*Collector) {
+	return func(c *Collector) {
+		d.Init()
+		c.debugger = d
 	}
 }
 
@@ -167,20 +229,16 @@ func NewContext() *Context {
 func (c *Collector) Init() {
 	c.UserAgent = "colly - https://github.com/gocolly/colly"
 	c.MaxDepth = 0
-	c.visitedURLs = make([]string, 0, 8)
-	c.htmlCallbacks = make([]*htmlCallbackContainer, 0, 8)
-	c.requestCallbacks = make([]RequestCallback, 0, 8)
-	c.responseCallbacks = make([]ResponseCallback, 0, 8)
-	c.errorCallbacks = make([]ErrorCallback, 0, 8)
+	c.visitedURLs = make(map[uint64]bool)
 	c.MaxBodySize = 10 * 1024 * 1024
 	c.backend = &httpBackend{}
 	c.backend.Init()
 	c.backend.Client.CheckRedirect = c.checkRedirectFunc()
 	c.wg = &sync.WaitGroup{}
 	c.lock = &sync.RWMutex{}
-	c.robotsMap = make(map[string]*robotstxt.RobotsData, 0)
+	c.robotsMap = make(map[string]*robotstxt.RobotsData)
 	c.IgnoreRobotsTxt = true
-	c.Id = atomic.AddInt32(&collectorCounter, 1)
+	c.ID = atomic.AddUint32(&collectorCounter, 1)
 }
 
 // Appengine will replace the Collector's backend http.Client
@@ -201,19 +259,19 @@ func (c *Collector) Appengine(req *http.Request) {
 // request to the URL specified in parameter.
 // Visit also calls the previously provided callbacks
 func (c *Collector) Visit(URL string) error {
-	return c.scrape(URL, "GET", 1, nil, nil, nil)
+	return c.scrape(URL, "GET", 1, nil, nil, nil, true)
 }
 
 // Post starts a collector job by creating a POST request.
 // Post also calls the previously provided callbacks
 func (c *Collector) Post(URL string, requestData map[string]string) error {
-	return c.scrape(URL, "POST", 1, createFormReader(requestData), nil, nil)
+	return c.scrape(URL, "POST", 1, createFormReader(requestData), nil, nil, true)
 }
 
 // PostRaw starts a collector job by creating a POST request with raw binary data.
 // Post also calls the previously provided callbacks
 func (c *Collector) PostRaw(URL string, requestData []byte) error {
-	return c.scrape(URL, "POST", 1, bytes.NewReader(requestData), nil, nil)
+	return c.scrape(URL, "POST", 1, bytes.NewReader(requestData), nil, nil, true)
 }
 
 // PostMultipart starts a collector job by creating a Multipart POST request
@@ -223,7 +281,7 @@ func (c *Collector) PostMultipart(URL string, requestData map[string][]byte) err
 	hdr := http.Header{}
 	hdr.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	hdr.Set("User-Agent", c.UserAgent)
-	return c.scrape(URL, "POST", 1, createMultipartReader(boundary, requestData), nil, hdr)
+	return c.scrape(URL, "POST", 1, createMultipartReader(boundary, requestData), nil, hdr, true)
 }
 
 // Request starts a collector job by creating a custom HTTP request
@@ -237,7 +295,7 @@ func (c *Collector) PostMultipart(URL string, requestData map[string][]byte) err
 //   - "PATCH"
 //   - "OPTIONS"
 func (c *Collector) Request(method, URL string, requestData io.Reader, ctx *Context, hdr http.Header) error {
-	return c.scrape(URL, method, 1, requestData, ctx, hdr)
+	return c.scrape(URL, method, 1, requestData, ctx, hdr, true)
 }
 
 // SetDebugger attaches a debugger to the collector
@@ -246,10 +304,10 @@ func (c *Collector) SetDebugger(d debug.Debugger) {
 	c.debugger = d
 }
 
-func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header) error {
+func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header, checkRevisit bool) error {
 	c.wg.Add(1)
 	defer c.wg.Done()
-	if err := c.requestCheck(u, method, depth); err != nil {
+	if err := c.requestCheck(u, method, depth, checkRevisit); err != nil {
 		return err
 	}
 	parsedURL, err := url.Parse(u)
@@ -260,7 +318,7 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 		parsedURL.Scheme = "http"
 	}
 	if !c.isDomainAllowed(parsedURL.Host) {
-		return errors.New("Forbidden domain")
+		return ErrForbiddenDomain
 	}
 	if !c.IgnoreRobotsTxt {
 		if err = c.checkRobots(parsedURL); err != nil {
@@ -287,8 +345,10 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 		Headers:   &req.Header,
 		Ctx:       ctx,
 		Depth:     depth,
+		Method:    method,
+		Body:      requestData,
 		collector: c,
-		Id:        atomic.AddInt32(&c.requestCount, 1),
+		ID:        atomic.AddUint32(&c.requestCount, 1),
 	}
 
 	c.handleOnRequest(request)
@@ -300,24 +360,30 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	if err := c.handleOnError(response, err, request, ctx); err != nil {
 		return err
 	}
-	atomic.AddInt32(&c.responseCount, 1)
+	if req.URL.String() != parsedURL.String() {
+		request.URL = req.URL
+		request.Headers = &req.Header
+	}
+	atomic.AddUint32(&c.responseCount, 1)
 	response.Ctx = ctx
 	response.Request = request
-	response.fixCharset()
+	response.fixCharset(c.DetectCharset)
 
 	c.handleOnResponse(response)
 
 	c.handleOnHTML(response)
 
+	c.handleOnScraped(response)
+
 	return nil
 }
 
-func (c *Collector) requestCheck(u, method string, depth int) error {
+func (c *Collector) requestCheck(u, method string, depth int, checkRevisit bool) error {
 	if u == "" {
-		return errors.New("Missing URL")
+		return ErrMissingURL
 	}
 	if c.MaxDepth > 0 && c.MaxDepth < depth {
-		return errors.New("Max depth limit reached")
+		return ErrMaxDepth
 	}
 	if len(c.URLFilters) > 0 {
 		matched := false
@@ -328,17 +394,21 @@ func (c *Collector) requestCheck(u, method string, depth int) error {
 			}
 		}
 		if !matched {
-			return errors.New("No URLFilters match")
+			return ErrNoURLFiltersMatch
 		}
 	}
-	if !c.AllowURLRevisit && method == "GET" {
-		for _, u2 := range c.visitedURLs {
-			if u2 == u {
-				return errors.New("URL already visited")
-			}
+	if checkRevisit && !c.AllowURLRevisit && method == "GET" {
+		h := fnv.New64a()
+		h.Write([]byte(u))
+		uHash := h.Sum64()
+		c.lock.RLock()
+		visited := c.visitedURLs[uHash]
+		c.lock.RUnlock()
+		if visited {
+			return ErrAlreadyVisited
 		}
 		c.lock.Lock()
-		c.visitedURLs = append(c.visitedURLs, u)
+		c.visitedURLs[uHash] = true
 		c.lock.Unlock()
 	}
 	return nil
@@ -388,7 +458,7 @@ func (c *Collector) checkRobots(u *url.URL) error {
 	}
 
 	if !uaGroup.Test(u.EscapedPath()) {
-		return errors.New("URL blocked by robots.txt")
+		return ErrRobotsTxtBlocked
 	}
 	return nil
 }
@@ -416,6 +486,9 @@ func (c *Collector) Wait() {
 // request made by the Collector
 func (c *Collector) OnRequest(f RequestCallback) {
 	c.lock.Lock()
+	if c.requestCallbacks == nil {
+		c.requestCallbacks = make([]RequestCallback, 0, 4)
+	}
 	c.requestCallbacks = append(c.requestCallbacks, f)
 	c.lock.Unlock()
 }
@@ -423,6 +496,9 @@ func (c *Collector) OnRequest(f RequestCallback) {
 // OnResponse registers a function. Function will be executed on every response
 func (c *Collector) OnResponse(f ResponseCallback) {
 	c.lock.Lock()
+	if c.responseCallbacks == nil {
+		c.responseCallbacks = make([]ResponseCallback, 0, 4)
+	}
 	c.responseCallbacks = append(c.responseCallbacks, f)
 	c.lock.Unlock()
 }
@@ -432,6 +508,9 @@ func (c *Collector) OnResponse(f ResponseCallback) {
 // GoQuery Selector is a selector used by https://github.com/PuerkitoBio/goquery
 func (c *Collector) OnHTML(goquerySelector string, f HTMLCallback) {
 	c.lock.Lock()
+	if c.htmlCallbacks == nil {
+		c.htmlCallbacks = make([]*htmlCallbackContainer, 0, 4)
+	}
 	c.htmlCallbacks = append(c.htmlCallbacks, &htmlCallbackContainer{
 		Selector: goquerySelector,
 		Function: f,
@@ -459,7 +538,21 @@ func (c *Collector) OnHTMLDetach(goquerySelector string) {
 // occurs during the HTTP request.
 func (c *Collector) OnError(f ErrorCallback) {
 	c.lock.Lock()
+	if c.errorCallbacks == nil {
+		c.errorCallbacks = make([]ErrorCallback, 0, 4)
+	}
 	c.errorCallbacks = append(c.errorCallbacks, f)
+	c.lock.Unlock()
+}
+
+// OnScraped registers a function. Function will be executed after
+// OnHTML, as a final part of the scraping.
+func (c *Collector) OnScraped(f ScrapedCallback) {
+	c.lock.Lock()
+	if c.scrapedCallbacks == nil {
+		c.scrapedCallbacks = make([]ScrapedCallback, 0, 4)
+	}
+	c.scrapedCallbacks = append(c.scrapedCallbacks, f)
 	c.lock.Unlock()
 }
 
@@ -483,30 +576,44 @@ func (c *Collector) SetRequestTimeout(timeout time.Duration) {
 	c.backend.Client.Timeout = timeout
 }
 
-// SetProxy sets a proxy for the collector. This overrides the previously
-// used http.Transport if the type of the transport is not http.RoundTripper
+// SetProxy sets a proxy for the collector. This method overrides the previously
+// used http.Transport if the type of the transport is not http.RoundTripper.
+// The proxy type is determined by the URL scheme. "http"
+// and "socks5" are supported. If the scheme is empty,
+// "http" is assumed.
 func (c *Collector) SetProxy(proxyURL string) error {
 	proxyParsed, err := url.Parse(proxyURL)
 	if err != nil {
 		return err
 	}
 
-	t, ok := c.backend.Client.Transport.(*http.Transport)
-	if c.backend.Client.Transport != nil && ok {
-		t.Proxy = http.ProxyURL(proxyParsed)
-	} else {
-		c.backend.Client.Transport = &http.Transport{
-			Proxy: http.ProxyURL(proxyParsed),
-		}
-	}
+	c.SetProxyFunc(http.ProxyURL(proxyParsed))
 
 	return nil
 }
 
-func createEvent(eventType string, requestId, collectorId int32, kvargs map[string]string) *debug.Event {
+// SetProxyFunc sets a custom proxy setter/switcher function.
+// See built-in ProxyFuncs for more details.
+// This method overrides the previously used http.Transport
+// if the type of the transport is not http.RoundTripper.
+// The proxy type is determined by the URL scheme. "http"
+// and "socks5" are supported. If the scheme is empty,
+// "http" is assumed.
+func (c *Collector) SetProxyFunc(p ProxyFunc) {
+	t, ok := c.backend.Client.Transport.(*http.Transport)
+	if c.backend.Client.Transport != nil && ok {
+		t.Proxy = p
+	} else {
+		c.backend.Client.Transport = &http.Transport{
+			Proxy: p,
+		}
+	}
+}
+
+func createEvent(eventType string, requestID, collectorID uint32, kvargs map[string]string) *debug.Event {
 	return &debug.Event{
-		CollectorId: collectorId,
-		RequestId:   requestId,
+		CollectorID: collectorID,
+		RequestID:   requestID,
 		Type:        eventType,
 		Values:      kvargs,
 	}
@@ -514,7 +621,7 @@ func createEvent(eventType string, requestId, collectorId int32, kvargs map[stri
 
 func (c *Collector) handleOnRequest(r *Request) {
 	if c.debugger != nil {
-		c.debugger.Event(createEvent("request", r.Id, c.Id, map[string]string{
+		c.debugger.Event(createEvent("request", r.ID, c.ID, map[string]string{
 			"url": r.URL.String(),
 		}))
 	}
@@ -525,7 +632,7 @@ func (c *Collector) handleOnRequest(r *Request) {
 
 func (c *Collector) handleOnResponse(r *Response) {
 	if c.debugger != nil {
-		c.debugger.Event(createEvent("response", r.Request.Id, c.Id, map[string]string{
+		c.debugger.Event(createEvent("response", r.Request.ID, c.ID, map[string]string{
 			"url":    r.Request.URL.String(),
 			"status": http.StatusText(r.StatusCode),
 		}))
@@ -536,7 +643,7 @@ func (c *Collector) handleOnResponse(r *Response) {
 }
 
 func (c *Collector) handleOnHTML(resp *Response) {
-	if strings.Index(strings.ToLower(resp.Headers.Get("Content-Type")), "html") == -1 {
+	if !strings.Contains(strings.ToLower(resp.Headers.Get("Content-Type")), "html") || len(c.htmlCallbacks) == 0 {
 		return
 	}
 	doc, err := goquery.NewDocumentFromReader(bytes.NewBuffer(resp.Body))
@@ -546,16 +653,9 @@ func (c *Collector) handleOnHTML(resp *Response) {
 	for _, cc := range c.htmlCallbacks {
 		doc.Find(cc.Selector).Each(func(i int, s *goquery.Selection) {
 			for _, n := range s.Nodes {
-				e := &HTMLElement{
-					Name:       n.Data,
-					Request:    resp.Request,
-					Response:   resp,
-					Text:       goquery.NewDocumentFromNode(n).Text(),
-					DOM:        s,
-					attributes: n.Attr,
-				}
+				e := NewHTMLElementFromSelectionNode(resp, s, n)
 				if c.debugger != nil {
-					c.debugger.Event(createEvent("html", resp.Request.Id, c.Id, map[string]string{
+					c.debugger.Event(createEvent("html", resp.Request.ID, c.ID, map[string]string{
 						"selector": cc.Selector,
 						"url":      resp.Request.URL.String(),
 					}))
@@ -580,7 +680,7 @@ func (c *Collector) handleOnError(response *Response, err error, request *Reques
 		}
 	}
 	if c.debugger != nil {
-		c.debugger.Event(createEvent("error", request.Id, c.Id, map[string]string{
+		c.debugger.Event(createEvent("error", request.ID, c.ID, map[string]string{
 			"url":    request.URL.String(),
 			"status": http.StatusText(response.StatusCode),
 		}))
@@ -592,6 +692,17 @@ func (c *Collector) handleOnError(response *Response, err error, request *Reques
 		f(response, err)
 	}
 	return err
+}
+
+func (c *Collector) handleOnScraped(r *Response) {
+	if c.debugger != nil {
+		c.debugger.Event(createEvent("scraped", r.Request.ID, c.ID, map[string]string{
+			"url": r.Request.URL.String(),
+		}))
+	}
+	for _, f := range c.scrapedCallbacks {
+		f(r)
+	}
 }
 
 // Limit adds a new LimitRule to the collector
@@ -607,7 +718,7 @@ func (c *Collector) Limits(rules []*LimitRule) error {
 // SetCookies handles the receipt of the cookies in a reply for the given URL
 func (c *Collector) SetCookies(URL string, cookies []*http.Cookie) error {
 	if c.backend.Client.Jar == nil {
-		return errors.New("Cookie jar is not available")
+		return ErrNoCookieJar
 	}
 	u, err := url.Parse(URL)
 	if err != nil {
@@ -634,22 +745,25 @@ func (c *Collector) Cookies(URL string) []*http.Cookie {
 // between collectors.
 func (c *Collector) Clone() *Collector {
 	return &Collector{
-		UserAgent:         c.UserAgent,
+		AllowedDomains:    c.AllowedDomains,
+		CacheDir:          c.CacheDir,
+		DisallowedDomains: c.DisallowedDomains,
+		ID:                atomic.AddUint32(&collectorCounter, 1),
+		IgnoreRobotsTxt:   c.IgnoreRobotsTxt,
+		MaxBodySize:       c.MaxBodySize,
 		MaxDepth:          c.MaxDepth,
-		visitedURLs:       make([]string, 0, 8),
+		URLFilters:        c.URLFilters,
+		UserAgent:         c.UserAgent,
+		backend:           c.backend,
+		debugger:          c.debugger,
+		errorCallbacks:    make([]ErrorCallback, 0, 8),
 		htmlCallbacks:     make([]*htmlCallbackContainer, 0, 8),
+		lock:              c.lock,
 		requestCallbacks:  make([]RequestCallback, 0, 8),
 		responseCallbacks: make([]ResponseCallback, 0, 8),
-		errorCallbacks:    make([]ErrorCallback, 0, 8),
-		CacheDir:          c.CacheDir,
-		MaxBodySize:       c.MaxBodySize,
-		backend:           c.backend,
-		wg:                c.wg,
-		lock:              c.lock,
 		robotsMap:         c.robotsMap,
-		IgnoreRobotsTxt:   c.IgnoreRobotsTxt,
-		Id:                atomic.AddInt32(&collectorCounter, 1),
-		debugger:          c.debugger,
+		visitedURLs:       make(map[uint64]bool),
+		wg:                c.wg,
 	}
 }
 
@@ -680,153 +794,6 @@ func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Requ
 
 		return nil
 	}
-}
-
-// Attr returns the selected attribute of a HTMLElement or empty string
-// if no attribute found
-func (h *HTMLElement) Attr(k string) string {
-	for _, a := range h.attributes {
-		if a.Key == k {
-			return a.Val
-		}
-	}
-	return ""
-}
-
-// ChildText returns the concatenated and stripped text content of the matching
-// elements.
-func (h *HTMLElement) ChildText(goquerySelector string) string {
-	return strings.TrimSpace(h.DOM.Find(goquerySelector).Text())
-}
-
-// ChildAttr returns the stripped text content of the first matching
-// element's attribute.
-func (h *HTMLElement) ChildAttr(goquerySelector, attrName string) string {
-	if attr, ok := h.DOM.Find(goquerySelector).Attr(attrName); ok {
-		return strings.TrimSpace(attr)
-	}
-	return ""
-}
-
-// ChildAttrs returns the stripped text content of all the matching
-// element's attributes.
-func (h *HTMLElement) ChildAttrs(goquerySelector, attrName string) []string {
-	res := make([]string, 0)
-	h.DOM.Find(goquerySelector).Each(func(_ int, s *goquery.Selection) {
-		if attr, ok := s.Attr(attrName); ok {
-			res = append(res, strings.TrimSpace(attr))
-		}
-	})
-	return res
-}
-
-// AbsoluteURL returns with the resolved absolute URL of an URL chunk.
-// AbsoluteURL returns empty string if the URL chunk is a fragment or
-// could not be parsed
-func (r *Request) AbsoluteURL(u string) string {
-	if strings.HasPrefix(u, "#") {
-		return ""
-	}
-	absURL, err := r.URL.Parse(u)
-	if err != nil {
-		return ""
-	}
-	absURL.Fragment = ""
-	if absURL.Scheme == "//" {
-		absURL.Scheme = r.URL.Scheme
-	}
-	return absURL.String()
-}
-
-// Visit continues Collector's collecting job by creating a
-// request and preserves the Context of the previous request.
-// Visit also calls the previously provided callbacks
-func (r *Request) Visit(URL string) error {
-	return r.collector.scrape(r.AbsoluteURL(URL), "GET", r.Depth+1, nil, r.Ctx, nil)
-}
-
-// Post continues a collector job by creating a POST request and preserves the Context
-// of the previous request.
-// Post also calls the previously provided callbacks
-func (r *Request) Post(URL string, requestData map[string]string) error {
-	return r.collector.scrape(r.AbsoluteURL(URL), "POST", r.Depth+1, createFormReader(requestData), r.Ctx, nil)
-}
-
-// PostRaw starts a collector job by creating a POST request with raw binary data.
-// PostRaw preserves the Context of the previous request
-// and calls the previously provided callbacks
-func (r *Request) PostRaw(URL string, requestData []byte) error {
-	return r.collector.scrape(r.AbsoluteURL(URL), "POST", r.Depth+1, bytes.NewReader(requestData), r.Ctx, nil)
-}
-
-// PostMultipart starts a collector job by creating a Multipart POST request
-// with raw binary data.  PostMultipart also calls the previously provided.
-// callbacks
-func (r *Request) PostMultipart(URL string, requestData map[string][]byte) error {
-	boundary := randomBoundary()
-	hdr := http.Header{}
-	hdr.Set("Content-Type", "multipart/form-data; boundary="+boundary)
-	hdr.Set("User-Agent", r.collector.UserAgent)
-	return r.collector.scrape(r.AbsoluteURL(URL), "POST", r.Depth+1, createMultipartReader(boundary, requestData), r.Ctx, hdr)
-}
-
-// UnmarshalBinary decodes Context value to nil
-// This function is used by request caching
-func (c *Context) UnmarshalBinary(_ []byte) error {
-	return nil
-}
-
-// MarshalBinary encodes Context value
-// This function is used by request caching
-func (c *Context) MarshalBinary() (_ []byte, _ error) {
-	return nil, nil
-}
-
-// Put stores a value of any type in Context
-func (c *Context) Put(key string, value interface{}) {
-	c.lock.Lock()
-	c.contextMap[key] = value
-	c.lock.Unlock()
-}
-
-// Get retrieves a string value from Context.
-// Get returns an empty string if key not found
-func (c *Context) Get(key string) string {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	if v, ok := c.contextMap[key]; ok {
-		return v.(string)
-	}
-	return ""
-}
-
-// GetAny retrieves a value from Context.
-// GetAny returns nil if key not found
-func (c *Context) GetAny(key string) interface{} {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	if v, ok := c.contextMap[key]; ok {
-		return v
-	}
-	return nil
-}
-
-// Save writes response body to disk
-func (r *Response) Save(fileName string) error {
-	return ioutil.WriteFile(fileName, r.Body, 0644)
-}
-
-// FileName returns the sanitized file name parsed from "Content-Disposition"
-// header or from URL
-func (r *Response) FileName() string {
-	_, params, err := mime.ParseMediaType(r.Headers.Get("Content-Disposition"))
-	if fName, ok := params["filename"]; ok && err == nil {
-		return SanitizeFileName(fName)
-	}
-	if r.Request.URL.RawQuery != "" {
-		return SanitizeFileName(fmt.Sprintf("%s_%s", r.Request.URL.Path, r.Request.URL.RawQuery))
-	}
-	return SanitizeFileName(r.Request.URL.Path[1:])
 }
 
 // SanitizeFileName replaces dangerous characters in a string
@@ -879,23 +846,4 @@ func randomBoundary() string {
 		panic(err)
 	}
 	return fmt.Sprintf("%x", buf[:])
-}
-
-func (r *Response) fixCharset() {
-	contentType := strings.ToLower(r.Headers.Get("Content-Type"))
-	if strings.Index(contentType, "charset") == -1 {
-		return
-	}
-	if strings.Index(contentType, "utf-8") != -1 || strings.Index(contentType, "utf8") != -1 {
-		return
-	}
-	encodedBodyReader, err := charset.NewReader(bytes.NewReader(r.Body), contentType)
-	if err != nil {
-		return
-	}
-	tmpBody, err := ioutil.ReadAll(encodedBodyReader)
-	if err != nil {
-		return
-	}
-	r.Body = tmpBody
 }

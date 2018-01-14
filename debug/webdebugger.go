@@ -12,17 +12,17 @@ type WebDebugger struct {
 	// Address is the address of the web server. It is 127.0.0.1:7676 by default.
 	Address         string
 	initialized     bool
-	CurrentRequests map[int32]requestInfo
+	CurrentRequests map[uint32]requestInfo
 	RequestLog      []requestInfo
 }
 
 type requestInfo struct {
-	Url            string
+	URL            string
 	Started        time.Time
 	Duration       time.Duration
 	ResponseStatus string
-	Id             int32
-	CollectorId    int32
+	ID             uint32
+	CollectorID    uint32
 }
 
 // Init initializes the WebDebugger
@@ -37,7 +37,7 @@ func (w *WebDebugger) Init() error {
 		w.Address = "127.0.0.1:7676"
 	}
 	w.RequestLog = make([]requestInfo, 0)
-	w.CurrentRequests = make(map[int32]requestInfo)
+	w.CurrentRequests = make(map[uint32]requestInfo)
 	http.HandleFunc("/", w.indexHandler)
 	http.HandleFunc("/status", w.statusHandler)
 	log.Println("Starting debug webserver on", w.Address)
@@ -49,18 +49,18 @@ func (w *WebDebugger) Init() error {
 func (w *WebDebugger) Event(e *Event) {
 	switch e.Type {
 	case "request":
-		w.CurrentRequests[e.RequestId] = requestInfo{
-			Url:         e.Values["url"],
+		w.CurrentRequests[e.RequestID] = requestInfo{
+			URL:         e.Values["url"],
 			Started:     time.Now(),
-			Id:          e.RequestId,
-			CollectorId: e.CollectorId,
+			ID:          e.RequestID,
+			CollectorID: e.CollectorID,
 		}
 	case "response", "error":
-		r := w.CurrentRequests[e.RequestId]
+		r := w.CurrentRequests[e.RequestID]
 		r.Duration = time.Since(r.Started)
 		r.ResponseStatus = e.Values["status"]
 		w.RequestLog = append(w.RequestLog, r)
-		delete(w.CurrentRequests, e.RequestId)
+		delete(w.CurrentRequests, e.RequestID)
 	}
 }
 
